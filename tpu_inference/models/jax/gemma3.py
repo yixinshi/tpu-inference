@@ -50,6 +50,24 @@ init_fn = nnx.initializers.uniform()
 modeling_flax_utils = FlaxUtils()
 
 
+class GemmaJaxRmsNorm(JaxRmsNorm):
+
+    def __call__(self,
+                 x: jax.Array,
+                 mask: Optional[jax.Array] = None) -> jax.Array:
+        # Gemma style RMSNorm: x * (1 + w)
+        
+        # Save original weight
+        w = self.weight.value
+        # Temporarily set weight to ones to get pure norm
+        self.weight.value = jnp.ones_like(w)
+        normed_x = super().__call__(x, mask=mask)
+        # Restore weight
+        self.weight.value = w
+        
+        return normed_x * (1.0 + w)
+
+
 class Gemma3MLP(JaxModule):
 
     def __init__(self,
@@ -60,7 +78,7 @@ class Gemma3MLP(JaxModule):
                  prefix: str = ".mlp"):
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
-        act = config.hidden_act
+        act = config.hidden_activation
 
         self.gate_proj = JaxLinear(
             hidden_size,
@@ -115,7 +133,18 @@ class Gemma3Attention(JaxModule):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.rope_theta = config.rope_theta
+        import re
+        layer_idx_match = re.search(r"layers\.(\d+)", prefix)
+        self.layer_idx = int(layer_idx_match.group(1)) if layer_idx_match else 0
+        self.is_sliding = config.layer_types[self.layer_idx] == "sliding_attention"
+
+        if self.is_sliding:
+            self.rope_theta = config.rope_local_base_freq
+            self.sliding_window = config.sliding_window
+        else:
+            self.rope_theta = config.rope_theta
+            self.sliding_window = None
+
         self.rope_scaling = getattr(config, "rope_scaling", None)
 
         self.head_dim_original = getattr(config, "head_dim",
@@ -134,7 +163,6 @@ class Gemma3Attention(JaxModule):
         self.q_proj = JaxEinsum(
             "TD,DNH->TNH",
             (self.hidden_size, self.num_heads, self.head_dim),
-            bias_shape=(self.num_heads, self.head_dim),
             dtype=dtype,
             kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
             bias_init=nnx.with_partitioning(init_fn, ("model", None)),
@@ -145,7 +173,6 @@ class Gemma3Attention(JaxModule):
         self.k_proj = JaxEinsum(
             "TD,DKH->TKH",
             (self.hidden_size, self.num_kv_heads, self.head_dim),
-            bias_shape=(self.num_kv_heads, self.head_dim),
             dtype=dtype,
             kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
             bias_init=nnx.with_partitioning(init_fn, ("model", None)),
@@ -156,7 +183,6 @@ class Gemma3Attention(JaxModule):
         self.v_proj = JaxEinsum(
             "TD,DKH->TKH",
             (self.hidden_size, self.num_kv_heads, self.head_dim),
-            bias_shape=(self.num_kv_heads, self.head_dim),
             dtype=dtype,
             kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
             bias_init=nnx.with_partitioning(init_fn, ("model", None)),
@@ -173,8 +199,12 @@ class Gemma3Attention(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".o_proj",
         )
-        self.q_norm = JaxRmsNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = JaxRmsNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaJaxRmsNorm(self.head_dim,
+                                 rngs=rng,
+                                 epsilon=config.rms_norm_eps)
+        self.k_norm = GemmaJaxRmsNorm(self.head_dim,
+                                 rngs=rng,
+                                 epsilon=config.rms_norm_eps)
 
         self._q_scale = 1.0
         self._k_scale = 1.0
@@ -184,7 +214,6 @@ class Gemma3Attention(JaxModule):
             self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
                 kv_cache_dtype)
 
-
     def __call__(
         self,
         kv_cache: Optional[jax.Array],
@@ -193,7 +222,7 @@ class Gemma3Attention(JaxModule):
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
         # q: (T, N, H)
-        q, k = self.q_proj(x), self.k_proj(x)  
+        q, k = self.q_proj(x), self.k_proj(x)
         q, k = self.q_norm(q), self.k_norm(k)
         # q: (T, N, H)
         q = apply_rope(q, md.input_positions, self.head_dim_original,
@@ -220,6 +249,7 @@ class Gemma3Attention(JaxModule):
             attention_metadata,
             self.mesh,
             self.head_dim_original,
+            attention_chunk_size=self.sliding_window,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -242,7 +272,7 @@ class Gemma3DecoderLayer(JaxModule):
         rms_norm_eps = config.rms_norm_eps
         hidden_size = config.hidden_size
 
-        self.input_layernorm = JaxRmsNorm(
+        self.input_layernorm = GemmaJaxRmsNorm(
             hidden_size,
             epsilon=rms_norm_eps,
             dtype=dtype,
@@ -261,18 +291,18 @@ class Gemma3DecoderLayer(JaxModule):
                                          prefix=prefix + ".self_attn")
 
 
-        self.post_attention_layernorm = JaxRmsNorm(
+        self.post_attention_layernorm = GemmaJaxRmsNorm(
             hidden_size,
             epsilon=rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
             quant_config=quant_config,
-            prefix=prefix + ".post_attention_layernormlp",
+            prefix=prefix + ".post_attention_layernorm",
         )
-        self.pre_feedforward_layernorm = JaxRmsNorm(
+        self.pre_feedforward_layernorm = GemmaJaxRmsNorm(
             config.hidden_size, 
-            eps=config.rms_norm_eps,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
@@ -286,9 +316,9 @@ class Gemma3DecoderLayer(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".mlp",
         )
-        self.post_feedforward_layernorm = JaxRmsNorm(
+        self.post_feedforward_layernorm = GemmaJaxRmsNorm(
             config.hidden_size, 
-            eps=config.rms_norm_eps,
+            epsilon=config.rms_norm_eps,
             param_dtype=dtype,
             scale_init=nnx.with_partitioning(init_fn, (None, )),
             rngs=rng,
@@ -360,8 +390,8 @@ class Gemma3Model(JaxModule):
                 quant_config=vllm_config.quant_config,
                 prefix=f"model.layers.{layer_idx}"))
         if self.is_last_rank:
-            self.norm = JaxRmsNorm(
-                hidden_size=hidden_size,
+            self.norm = GemmaJaxRmsNorm(
+                hidden_size,
                 epsilon=rms_norm_eps,
                 param_dtype=dtype,
                 scale_init=nnx.with_partitioning(init_fn, (None, )),
@@ -485,29 +515,29 @@ class Gemma3ForCausalLM(JaxModule):
         # Value: path to a nnx layer weight
         # https://huggingface.co/google/gemma-3-270m/blob/main/model.safetensors
         mappings = {
-            "model.embed_tokens": "model.embed.embedding",
+            "model.embed_tokens": "model.embed.weight",
             "model.layers.*.input_layernorm":
-            "model.layers.*.input_layernorm.scale",
+            "model.layers.*.input_layernorm.weight",
             "model.layers.*.mlp.down_proj":
-            "model.layers.*.mlp.down_proj.kernel",
+            "model.layers.*.mlp.down_proj.weight",
             "model.layers.*.mlp.gate_proj":
-            "model.layers.*.mlp.gate_proj.kernel",
-            "model.layers.*.mlp.up_proj": "model.layers.*.mlp.up_proj.kernel",
-            "model.layers.*.self_attn.q_norm": "model.layers.*.self_attn.q_norm.scale",
-            "model.layers.*.self_attn.k_norm": "model.layers.*.self_attn.k_norm.scale",
-            "model.layers.*.pre_feedforward_layernorm": "model.layers.*.pre_feedforward_layernorm.scale",
-            "model.layers.*.post_feedforward_layernorm": "model.layers.*.post_feedforward_layernorm.scale",
+            "model.layers.*.mlp.gate_proj.weight",
+            "model.layers.*.mlp.up_proj": "model.layers.*.mlp.up_proj.weight",
+            "model.layers.*.self_attn.q_norm": "model.layers.*.self_attn.q_norm.weight",
+            "model.layers.*.self_attn.k_norm": "model.layers.*.self_attn.k_norm.weight",
+            "model.layers.*.pre_feedforward_layernorm": "model.layers.*.pre_feedforward_layernorm.weight",
+            "model.layers.*.post_feedforward_layernorm": "model.layers.*.post_feedforward_layernorm.weight",
             "model.layers.*.post_attention_layernorm":
-            "model.layers.*.post_attention_layernorm.scale",
+            "model.layers.*.post_attention_layernorm.weight",
             "model.layers.*.self_attn.k_proj":
-            "model.layers.*.self_attn.k_proj.kernel",
+            "model.layers.*.self_attn.k_proj.weight",
             "model.layers.*.self_attn.o_proj":
-            "model.layers.*.self_attn.o_proj.kernel",
+            "model.layers.*.self_attn.o_proj.weight",
             "model.layers.*.self_attn.q_proj":
-            "model.layers.*.self_attn.q_proj.kernel",
+            "model.layers.*.self_attn.q_proj.weight",
             "model.layers.*.self_attn.v_proj":
-            "model.layers.*.self_attn.v_proj.kernel",
-            "model.norm": "model.norm.scale",
+            "model.layers.*.self_attn.v_proj.weight",
+            "model.norm": "model.norm.weight",
         }
         # Add lm_head mapping only if it's not tied to embeddings
         if not self.vllm_config.model_config.hf_config.tie_word_embeddings:

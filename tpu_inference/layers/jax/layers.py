@@ -32,6 +32,7 @@ class FlaxUtils:
     ACT2FN = {
         'silu': nnx.silu,
         'gelu': nnx.gelu,
+        'gelu_pytorch_tanh': lambda x: jax.nn.gelu(x, approximate=True),
         'relu': nnx.relu,
         'sigmoid': nnx.sigmoid,
         'softmax': nnx.softmax
