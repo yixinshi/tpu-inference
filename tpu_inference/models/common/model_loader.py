@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# yxshi
 
 import functools
 from typing import Any, Optional
@@ -68,6 +69,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     # would cause JAX init failure when using multi hosts with Ray.
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
+    from tpu_inference.models.jax.gemma3 import Gemma3ForCausalLM
     from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
@@ -90,6 +92,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Eagle3LlamaForCausalLM"] = EagleLlama3ForCausalLM
     _MODEL_REGISTRY["GptOssForCausalLM"] = GptOss
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
+    _MODEL_REGISTRY["Gemma3ForCausalLM"] = Gemma3ForCausalLM
     _MODEL_REGISTRY["Gemma4ForConditionalGeneration"] = Gemma4ForCausalLM
 
     architectures = getattr(config, "architectures", [])
